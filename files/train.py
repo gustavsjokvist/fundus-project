@@ -1,6 +1,6 @@
 """Fine-tune an ImageNet-pretrained ResNet-50 for binary referable-DR classification.
 Model selection uses validation AUROC only. The test split and the external set are never touched here."""
-import argparse, os, random
+import argparse, json, os, random, subprocess
 import numpy as np
 import torch, torch.nn as nn
 import torchvision
@@ -12,6 +12,14 @@ from data import FundusDataset
 
 def seed_all(s):
     random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+
+def git_hash():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True,
+                                       stderr=subprocess.DEVNULL, cwd=os.path.dirname(os.path.abspath(__file__))).strip()
+    except Exception:
+        return None
 
 
 def build_model():
@@ -44,6 +52,8 @@ def main():
 
     seed_all(a.seed)
     os.makedirs(a.out, exist_ok=True)
+    with open(os.path.join(a.out, "args.json"), "w") as f:  # predict.py reads --size from here
+        json.dump({**vars(a), "git": git_hash()}, f, indent=2)
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     print("device:", device)
 

@@ -7,6 +7,12 @@ Protocol
      AUROC, sensitivity/specificity at the frozen threshold, specificity at fixed 90% sensitivity
      (re-picked on that dataset), ECE before/after temperature scaling, with bootstrap 95% CIs.
 The gap between 'frozen threshold' and 're-picked threshold' on the external set is the practical cost of shift.
+
+Quality gate (if the prediction CSVs have a 'quality' column from preprocess.py)
+  4. Freeze a quality cutoff at the --abstain-frac quantile of VAL quality; images below it are rejected
+     ("please retake the photo"). Report coverage and metrics on kept vs rejected images.
+  5. Sweep the abstention fraction and compare against a confidence baseline that rejects the images whose
+     logit is closest to the operating threshold.
 """
 import argparse, json, os
 import numpy as np
@@ -69,6 +75,10 @@ def bootstrap(fn, scores, y, n=1000, seed=0):
     return float(np.nanpercentile(vals, 2.5)), float(np.nanpercentile(vals, 97.5))
 
 
+def safe_auc(y, scores):
+    return float(roc_auc_score(y, scores)) if 0 < y.sum() < len(y) else float("nan")
+
+
 def fmt(v, ci):
     return f"{v:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]"
 
@@ -78,6 +88,60 @@ def load(path):
     return d["logit"].to_numpy(float), d["label"].to_numpy(int)
 
 
+def quality_gate(val, sets, thr, a):
+    """val/sets hold DataFrames with logit, label, quality. Returns results dict and saves the sweep figure."""
+    q_cut = float(np.quantile(val["quality"], a.abstain_frac))
+    out = {"abstain_frac_on_val": a.abstain_frac, "quality_cutoff": q_cut, "sets": {}}
+    print(f"\n== Quality gate: reject quality < {q_cut:.3f} (the {a.abstain_frac:.0%} quantile on val) ==")
+    for name, d in sets.items():
+        lg, y, q = d["logit"].to_numpy(float), d["label"].to_numpy(int), d["quality"].to_numpy(float)
+        res = {"coverage": float((q >= q_cut).mean())}
+        for part, m in [("kept", q >= q_cut), ("rejected", q < q_cut)]:
+            if not m.any():
+                res[part] = {"n": 0}
+                continue
+            sens, spec = sens_spec(lg[m], y[m], thr)
+            res[part] = {"n": int(m.sum()), "prevalence": float(y[m].mean()), "auroc": safe_auc(y[m], lg[m]),
+                         "frozen_threshold_sensitivity": sens, "frozen_threshold_specificity": spec}
+        k = q >= q_cut
+        res["kept"]["frozen_threshold_sensitivity_ci"] = bootstrap(lambda s, t: sens_spec(s, t, thr)[0], lg[k], y[k], a.boot)
+        out["sets"][name] = res
+        kp, rj = res["kept"], res["rejected"]
+        print(f"{name}: coverage {res['coverage']:.1%}; kept n={kp['n']} AUROC {kp['auroc']:.3f} "
+              f"sens {kp['frozen_threshold_sensitivity']:.3f} spec {kp['frozen_threshold_specificity']:.3f}"
+              + (f" | rejected n={rj['n']} sens {rj['frozen_threshold_sensitivity']:.3f} "
+                 f"spec {rj['frozen_threshold_specificity']:.3f}" if rj["n"] else " | rejected n=0"))
+
+    # sweep: cutoffs frozen on val, applied to each set; x-axis is the fraction actually rejected on that set
+    fracs = np.linspace(0, 0.30, 16)
+    conf_val = np.abs(val["logit"].to_numpy(float) - thr)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    sweep = {}
+    for name, d in sets.items():
+        lg, y = d["logit"].to_numpy(float), d["label"].to_numpy(int)
+        crit = {"quality": (d["quality"].to_numpy(float), val["quality"].to_numpy(float)),
+                "confidence": (np.abs(lg - thr), conf_val)}
+        for crit_name, (score, score_val) in crit.items():
+            xs, sens_l, spec_l = [], [], []
+            for f in fracs:
+                keep = score >= np.quantile(score_val, f) if f > 0 else np.ones(len(y), bool)
+                if (y[keep] == 1).any() and (y[keep] == 0).any():
+                    sens, spec = sens_spec(lg[keep], y[keep], thr)
+                    xs.append(1 - keep.mean()); sens_l.append(sens); spec_l.append(spec)
+            sweep[f"{name}/{crit_name}"] = {"rejected": xs, "sensitivity": sens_l, "specificity": spec_l}
+            ls = "-" if name == "external" else "--"
+            mk = "o" if crit_name == "quality" else "s"
+            axes[0].plot(xs, sens_l, ls, marker=mk, ms=3, label=f"{name}, {crit_name} gate")
+            axes[1].plot(xs, spec_l, ls, marker=mk, ms=3, label=f"{name}, {crit_name} gate")
+    axes[0].axhline(a.target_sens, color="k", lw=0.8, ls=":")
+    axes[0].set(xlabel="fraction of images rejected", ylabel="sensitivity @ frozen threshold", title="Sensitivity vs abstention")
+    axes[1].set(xlabel="fraction of images rejected", ylabel="specificity @ frozen threshold", title="Specificity vs abstention")
+    axes[0].legend(fontsize=7)
+    plt.tight_layout(); plt.savefig(os.path.join(a.out, "quality_gate.png"), dpi=150); plt.close(fig)
+    out["sweep"] = sweep
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--val", required=True)
@@ -85,6 +149,7 @@ def main():
     ap.add_argument("--external", required=True)
     ap.add_argument("--target-sens", type=float, default=0.90)
     ap.add_argument("--boot", type=int, default=1000)
+    ap.add_argument("--abstain-frac", type=float, default=0.10, help="quality gate: fraction of VAL images to reject")
     ap.add_argument("--out", default="results")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -141,10 +206,16 @@ def main():
     axes[0].legend()
     axes[1].plot([0, 1], [0, 1], "k:", lw=0.8); axes[1].set(xlabel="predicted probability", ylabel="observed frequency", title="Reliability")
     axes[1].legend(fontsize=7)
-    plt.tight_layout(); plt.savefig(os.path.join(a.out, "roc_and_calibration.png"), dpi=150)
+    plt.tight_layout(); plt.savefig(os.path.join(a.out, "roc_and_calibration.png"), dpi=150); plt.close(fig)
+
+    dfs = {"val": pd.read_csv(a.val), "internal": pd.read_csv(a.internal), "external": pd.read_csv(a.external)}
+    if all("quality" in d.columns for d in dfs.values()):
+        results["quality_gate"] = quality_gate(dfs["val"], {k: dfs[k] for k in sets}, thr, a)
+    else:
+        print("\n(no 'quality' column in the prediction CSVs; skipping the quality gate - run preprocess.py first)")
     with open(os.path.join(a.out, "metrics.json"), "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nSaved metrics.json and roc_and_calibration.png to {a.out}/")
+    print(f"\nSaved metrics.json and figures to {a.out}/")
 
 
 if __name__ == "__main__":

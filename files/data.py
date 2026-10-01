@@ -8,15 +8,34 @@ import torchvision.transforms as T
 MEAN, STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
 
-def crop_black_borders(img: Image.Image, thresh: int = 10) -> Image.Image:
+FOV_THRESH = 10
+
+
+def fov_mask(img: Image.Image, thresh: int = FOV_THRESH) -> np.ndarray:
+    """Boolean mask of the (non-black) fundus field of view."""
+    return np.asarray(img.convert("L")) > thresh
+
+
+def crop_black_borders(img: Image.Image, thresh: int = FOV_THRESH) -> Image.Image:
     """Crop the black background around the circular fundus field of view.
     Fundus cameras differ in how much border they leave, so this removes one easy source of shift."""
-    arr = np.asarray(img.convert("L"))
-    mask = arr > thresh
+    mask = fov_mask(img, thresh)
     if mask.sum() < 0.05 * mask.size:  # nearly black image: leave as is
         return img
     rows, cols = np.where(mask)
     return img.crop((cols.min(), rows.min(), cols.max() + 1, rows.max() + 1))
+
+
+def pad_to_square(img: Image.Image) -> Image.Image:
+    """Pad with black to a square, centred. Many fundus images have the circular field cut off at the
+    top and bottom; resizing those straight to a square would stretch the retina."""
+    w, h = img.size
+    if w == h:
+        return img
+    side = max(w, h)
+    out = Image.new(img.mode, (side, side))
+    out.paste(img, ((side - w) // 2, (side - h) // 2))
+    return out
 
 
 def make_transforms(size: int, train: bool):
@@ -45,5 +64,6 @@ class FundusDataset(Dataset):
 
     def __getitem__(self, i):
         row = self.df.iloc[i]
-        img = crop_black_borders(Image.open(row["image_path"]).convert("RGB"))
+        # cheap no-op on images already cached by preprocess.py
+        img = pad_to_square(crop_black_borders(Image.open(row["image_path"]).convert("RGB")))
         return self.tf(img), torch.tensor(float(row["label"]))
