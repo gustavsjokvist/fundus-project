@@ -28,8 +28,12 @@ def main():
         cols = pd.read_csv(p, nrows=0).columns.str.strip()
         if "Retinopathy grade" in cols and subset_of(os.path.relpath(p, a.root)):
             csvs[subset_of(os.path.relpath(p, a.root))] = p
+    jpgs = glob.glob(os.path.join(a.root, "**", "*.jpg"), recursive=True)
+    # the full IDRiD download also has Localization/Segmentation folders with train/test subfolders and the same
+    # file names; use only the Disease Grading images when they can be told apart
+    grading = [p for p in jpgs if "grading" in os.path.relpath(p, a.root).lower()]
     images = {}
-    for p in glob.glob(os.path.join(a.root, "**", "*.jpg"), recursive=True):
+    for p in grading or jpgs:
         s = subset_of(os.path.relpath(os.path.dirname(p), a.root))
         if s:
             images.setdefault(s, {})[os.path.splitext(os.path.basename(p))[0]] = p
