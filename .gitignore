@@ -8,3 +8,4 @@ preds/
 results/
 *.pt
 .ipynb_checkpoints/
+results.zip
